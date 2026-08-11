@@ -1,10 +1,12 @@
 #include "arp_message.hh"
+#include "lua_config.hh"
 #include "router.hh"
 #include "util.hh"
 
 #include <iostream>
 #include <list>
 #include <unordered_map>
+#include <vector>
 
 using namespace std;
 
@@ -151,7 +153,20 @@ class Network {
   private:
     Router _router{};
 
-    size_t default_id, eth0_id, eth1_id, eth2_id, uun3_id, hs4_id, mit5_id;
+    // For the hardcoded constructor: named interface indices.
+    size_t default_id{0}, eth0_id{0}, eth1_id{0}, eth2_id{0}, uun3_id{0}, hs4_id{0}, mit5_id{0};
+
+    // For the Lua-driven constructor: interface name → index.
+    std::unordered_map<std::string, size_t> _interface_ids{};
+
+    // Physical connections. Each entry is a pair of (router_interface_name, host_name).
+    // The Lua constructor populates this so simulate_physical_connections() works
+    // without knowing the topology ahead of time.
+    struct Connection {
+        std::string iface_name;
+        std::string host_name;
+    };
+    std::vector<Connection> _connections{};
 
     std::unordered_map<string, Host> _hosts{};
 
@@ -233,17 +248,28 @@ class Network {
     }
 
     void simulate_physical_connections() {
-        exchange_frames(
-            "router.default", _router.interface(default_id), "default_router", host("default_router").interface());
-        exchange_frames("router.eth0", _router.interface(eth0_id), "applesauce", host("applesauce").interface());
-        exchange_frames("router.eth2", _router.interface(eth2_id), "cherrypie", host("cherrypie").interface());
-        exchange_frames("router.hs4", _router.interface(hs4_id), "hs_router", host("hs_router").interface());
-        exchange_frames("router.uun3",
-                        _router.interface(uun3_id),
-                        "dm42",
-                        host("dm42").interface(),
-                        "dm43",
-                        host("dm43").interface());
+        if (_connections.empty()) {
+            // Hardcoded topology: use the original per-interface exchange logic.
+            exchange_frames(
+                "router.default", _router.interface(default_id), "default_router", host("default_router").interface());
+            exchange_frames("router.eth0", _router.interface(eth0_id), "applesauce", host("applesauce").interface());
+            exchange_frames("router.eth2", _router.interface(eth2_id), "cherrypie", host("cherrypie").interface());
+            exchange_frames("router.hs4", _router.interface(hs4_id), "hs_router", host("hs_router").interface());
+            exchange_frames("router.uun3",
+                            _router.interface(uun3_id),
+                            "dm42",
+                            host("dm42").interface(),
+                            "dm43",
+                            host("dm43").interface());
+        } else {
+            // Lua-driven topology: iterate the connection list.
+            for (auto &conn : _connections) {
+                const size_t iface_id = _interface_ids.at(conn.iface_name);
+                const string label = "router." + conn.iface_name;
+                exchange_frames(label, _router.interface(iface_id),
+                                conn.host_name, host(conn.host_name).interface());
+            }
+        }
     }
 
     void simulate() {
@@ -266,6 +292,92 @@ class Network {
             throw runtime_error("invalid host: " + name);
         }
         return it->second;
+    }
+
+    //! Construct a Network from a Lua configuration script.
+    explicit Network(LuaConfig &lua) {
+        auto *L = lua.state();
+        // The script has already been run; the result table is on top of the stack.
+
+        // ---- 1. Interfaces ----
+        if (LuaConfig::push_field(L, "interfaces")) {
+            LuaConfig::for_each(L, [&](int) {
+                auto name = LuaConfig::get_string(L, "name");
+                auto ip_s = LuaConfig::get_string(L, "ip");
+                if (name && ip_s) {
+                    const size_t id = _router.add_interface({random_router_ethernet_address(), {ip_s.value(), 0}});
+                    _interface_ids[name.value()] = id;
+                    cerr << "  Lua: interface " << name.value() << " (" << ip_s.value() << ") = id " << id << "\n";
+                }
+            });
+            lua_pop(L, 1);  // pop interfaces table
+        }
+
+        // ---- 2. Hosts ----
+        if (LuaConfig::push_field(L, "hosts")) {
+            LuaConfig::for_each_pair(L, [&](const char *host_name) {
+                auto ip_s = LuaConfig::get_string(L, "ip");
+                auto hop_s = LuaConfig::get_string(L, "next_hop");
+                if (ip_s && hop_s) {
+                    _hosts.emplace(host_name, Host{host_name, {ip_s.value(), 0}, {hop_s.value(), 0}});
+                    cerr << "  Lua: host " << host_name << " ip=" << ip_s.value() << "\n";
+                }
+            });
+            lua_pop(L, 1);  // pop hosts table
+        }
+
+        // ---- 3. Routes ----
+        if (LuaConfig::push_field(L, "routes")) {
+            LuaConfig::for_each(L, [&](int) {
+                auto prefix_s = LuaConfig::get_string(L, "prefix");
+                auto len_i = LuaConfig::get_int(L, "len");
+                auto hop_s = LuaConfig::get_string(L, "next_hop");
+                auto iface_s = LuaConfig::get_string(L, "interface");
+                if (prefix_s && len_i && iface_s) {
+                    const uint32_t prefix = Address{prefix_s.value(), 0}.ipv4_numeric();
+                    const uint8_t len = static_cast<uint8_t>(len_i.value());
+                    const size_t iface_id = _interface_ids.at(iface_s.value());
+                    std::optional<Address> next_hop;
+                    if (hop_s && !hop_s.value().empty() && host_exists(hop_s.value())) {
+                        next_hop = host(hop_s.value()).address();
+                    } else if (hop_s) {
+                        next_hop = Address{hop_s.value(), 0};
+                    }
+                    _router.add_route(prefix, len, next_hop, iface_id);
+                }
+            });
+            lua_pop(L, 1);  // pop routes table
+        }
+
+        // ---- 4. Connections ----
+        if (LuaConfig::push_field(L, "connections")) {
+            LuaConfig::for_each(L, [&](int) {
+                auto iface_s = LuaConfig::get_string(L, "router");
+                auto host_s = LuaConfig::get_string(L, "host");
+                if (iface_s && host_s) {
+                    _connections.push_back({iface_s.value(), host_s.value()});
+                    cerr << "  Lua: connection " << iface_s.value() << " <-> " << host_s.value() << "\n";
+                } else if (iface_s) {
+                    // Check for multi-host list: key = "hosts" (array)
+                    bool has_multi = LuaConfig::push_field(L, "hosts");
+                    if (has_multi) {
+                        LuaConfig::for_each(L, [&](int) {
+                            auto h = LuaConfig::peek_string(L, -1);
+                            if (!h.empty()) {
+                                _connections.push_back({iface_s.value(), h});
+                            }
+                        });
+                        lua_pop(L, 1);  // pop hosts array
+                    }
+                }
+            });
+            lua_pop(L, 1);  // pop connections table
+        }
+    }
+
+    //! Check whether a host name exists (used during route construction).
+    bool host_exists(const string &name) const {
+        return _hosts.find(name) != _hosts.end();
     }
 };
 
@@ -343,8 +455,65 @@ void network_simulator() {
     cout << "\n\n\033[32;1mCongratulations! All datagrams were routed successfully.\033[m\n";
 }
 
-int main() {
+//! Run the network simulator driven by a Lua topology file.
+int network_simulator_lua(const string &filename) {
+    const string green = "\033[32;1m", normal = "\033[m";
+
+    cerr << green << "Loading network from " << filename << "..." << normal << "\n";
+    LuaConfig lua{filename};
+
+    cerr << green << "Constructing network from Lua config." << normal << "\n";
+    Network network{lua};
+
+    // Re-read the tests table from the Lua config and run each test.
+    auto *L = lua.state();
+    if (!LuaConfig::push_field(L, "tests")) {
+        cerr << "\033[33;1mWarning: no tests defined in Lua config.\033[m\n";
+        return EXIT_SUCCESS;
+    }
+
+    LuaConfig::for_each(L, [&](int) {
+        auto from_s = LuaConfig::get_string(L, "from");
+        auto to_s = LuaConfig::get_string(L, "to");
+        auto desc_s = LuaConfig::get_string(L, "desc");
+        auto ttl_i = LuaConfig::get_int(L, "ttl");
+
+        if (!from_s || !to_s) {
+            return;  // skip malformed test entry
+        }
+
+        const string desc = desc_s.value_or(from_s.value() + " -> " + to_s.value());
+        cout << green << "\n\nTesting " << desc << " (" << from_s.value() << " -> " << to_s.value()
+             << ")..." << normal << "\n\n";
+
+        const uint8_t ttl = ttl_i.has_value() ? static_cast<uint8_t>(ttl_i.value()) : 64;
+        auto dgram_sent = network.host(from_s.value()).send_to({to_s.value()}, ttl);
+
+        if (ttl_i.has_value() && ttl_i.value() <= 1) {
+            // TTL expiration test: don't expect delivery, just simulate.
+            network.simulate();
+        } else {
+            // Normal test: expect delivery to the destination.
+            dgram_sent.header().ttl--;
+            // If `to` is a host name, expect it there; otherwise it's an
+            // external IP routed via the default gateway.
+            if (network.host_exists(to_s.value())) {
+                network.host(to_s.value()).expect(dgram_sent);
+            }
+            network.simulate();
+        }
+    });
+    lua_pop(L, 1);  // pop tests table
+
+    cout << "\n\n\033[32;1mCongratulations! All Lua-defined tests passed.\033[m\n";
+    return EXIT_SUCCESS;
+}
+
+int main(int argc, char **argv) {
     try {
+        if (argc > 1) {
+            return network_simulator_lua(argv[1]);
+        }
         network_simulator();
     } catch (const exception &e) {
         cerr << "\n\n\n";
