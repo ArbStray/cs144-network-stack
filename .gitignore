@@ -1,0 +1,14 @@
+*.a
+*.o
+/build
+/.ccls-cache
+/.cache
+CMakeCache.txt
+CMakeFiles
+Makefile
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+# Local junk / personal files
+aa.txt
+.vscode/sftp.json
